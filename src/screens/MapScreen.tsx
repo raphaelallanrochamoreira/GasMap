@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import {
   StyleSheet,
   View,
@@ -6,7 +6,7 @@ import {
   ActivityIndicator,
   Text,
 } from 'react-native';
-import MapView, { Marker, PROVIDER_DEFAULT } from 'react-native-maps';
+import { WebView } from 'react-native-webview';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
@@ -15,13 +15,92 @@ import { Colors, Spacing, Radius, Shadows } from '../theme';
 import { useAppDispatch, useAppSelector } from '../store';
 import { selectStation } from '../store/slices/appSlice';
 import { haversineDistanceKm } from '../utils/geo';
-import { StationMarker } from '../components/StationMarker';
 import { StationBottomSheet } from '../components/StationBottomSheet';
 import { FilterBar } from '../components/FilterBar';
+import { Station } from '../types';
+import { BRAND_COLORS, FUEL_SHORT } from '../utils/fuel';
 import { DEFAULT_REGION } from '../data/mockStations';
 
+// ─── Build Leaflet HTML ───────────────────────────────────────────────────────
+
+function buildLeafletHTML(
+  stations: Station[],
+  userLat?: number,
+  userLng?: number,
+): string {
+  const center = userLat
+    ? `[${userLat}, ${userLng}]`
+    : `[${DEFAULT_REGION.latitude}, ${DEFAULT_REGION.longitude}]`;
+
+  const markersJS = stations
+    .map(s => {
+      const color = BRAND_COLORS[s.brand] ?? '#F97316';
+      const topPrice = s.prices[0];
+      const priceLabel = topPrice
+        ? `${FUEL_SHORT[topPrice.type]} R$${topPrice.price.toFixed(2)}`
+        : s.brand.slice(0, 3).toUpperCase();
+      const opacityVal = s.isOpen ? '1' : '0.55';
+
+      const iconHtml = [
+        '<div style="display:flex;flex-direction:column;align-items:center;opacity:' + opacityVal + '">',
+        '<div style="background:rgba(15,23,42,0.97);border:2px solid ' + color + ';border-radius:10px;padding:4px 8px;min-width:82px;text-align:center;box-shadow:0 3px 10px rgba(0,0,0,0.7);">',
+        '<div style="color:' + color + ';font-size:9px;font-weight:800;letter-spacing:.5px">' + s.brand.slice(0, 3).toUpperCase() + '</div>',
+        '<div style="color:#F8FAFC;font-size:11px;font-weight:700;margin-top:1px">' + priceLabel + '</div>',
+        '</div>',
+        '<div style="width:10px;height:10px;border-radius:50%;background:' + color + ';margin-top:3px;border:2px solid #0F172A"></div>',
+        '</div>',
+      ].join('');
+
+      return (
+        '(function(){' +
+        'var ic=L.divIcon({html:\'' + iconHtml.replace(/'/g, "\\'") + '\',iconSize:[88,50],iconAnchor:[44,50],className:\'\'});' +
+        'var mk=L.marker([' + s.coordinates.latitude + ',' + s.coordinates.longitude + '],{icon:ic});' +
+        'mk.on(\'click\',function(e){L.DomEvent.stopPropagation(e);window.ReactNativeWebView.postMessage(JSON.stringify({type:\'select\',id:\'' + s.id + '\'}));});' +
+        'mk.addTo(map);' +
+        '})();'
+      );
+    })
+    .join('\n');
+
+  const userDot = userLat
+    ? 'L.marker([' + userLat + ',' + userLng + '],{icon:L.divIcon({html:\'<div style="width:16px;height:16px;border-radius:50%;background:#3B82F6;border:3px solid #fff;box-shadow:0 0 0 4px rgba(59,130,246,.35)"></div>\',iconSize:[16,16],iconAnchor:[8,8],className:\'\'})}).addTo(map);'
+    : '';
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body,#map{width:100%;height:100%;background:#0F172A}
+.leaflet-tile-pane{filter:brightness(.72) saturate(.85) hue-rotate(5deg)}
+.leaflet-control-zoom{border:1px solid #334155!important;border-radius:10px!important;overflow:hidden}
+.leaflet-control-zoom a{background:#1E293B!important;color:#94A3B8!important;border-bottom:1px solid #334155!important;font-weight:700}
+.leaflet-control-zoom a:hover{background:#334155!important;color:#F8FAFC!important}
+.leaflet-control-attribution{display:none!important}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+var map=L.map('map',{center:${center},zoom:15,zoomControl:true});
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19,subdomains:'abcd'}).addTo(map);
+${userDot}
+${markersJS}
+map.on('click',function(){window.ReactNativeWebView.postMessage(JSON.stringify({type:'deselect'}));});
+window.centerOnUser=function(lat,lng){map.setView([lat,lng],16,{animate:true});};
+<\/script>
+</body>
+</html>`;
+}
+
+// ─── MapScreen ────────────────────────────────────────────────────────────────
+
 export function MapScreen() {
-  const mapRef = useRef<MapView>(null);
+  const webViewRef = useRef<WebView>(null);
   const dispatch = useAppDispatch();
   const { stations, selectedStationId, filters } = useAppSelector(s => s.app);
 
@@ -30,21 +109,23 @@ export function MapScreen() {
     longitude: number;
   } | null>(null);
   const [locationLoading, setLocationLoading] = useState(false);
+  const [mapReady, setMapReady] = useState(false);
 
-  // Request location on mount
   useEffect(() => {
     (async () => {
       setLocationLoading(true);
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === 'granted') {
-        const loc = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced,
-        });
-        setUserLocation({
-          latitude: loc.coords.latitude,
-          longitude: loc.coords.longitude,
-        });
-      }
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status === 'granted') {
+          const loc = await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.Balanced,
+          });
+          setUserLocation({
+            latitude: loc.coords.latitude,
+            longitude: loc.coords.longitude,
+          });
+        }
+      } catch (_) {}
       setLocationLoading(false);
     })();
   }, []);
@@ -82,18 +163,21 @@ export function MapScreen() {
   const selectedStation =
     filteredStations.find(s => s.id === selectedStationId) ?? null;
 
-  const centerOnUser = async () => {
+  const html = buildLeafletHTML(
+    filteredStations,
+    userLocation?.latitude,
+    userLocation?.longitude,
+  );
+
+  const centerOnUser = useCallback(async () => {
     if (userLocation) {
-      mapRef.current?.animateToRegion(
-        {
-          ...userLocation,
-          latitudeDelta: 0.02,
-          longitudeDelta: 0.02,
-        },
-        600,
+      webViewRef.current?.injectJavaScript(
+        `window.centerOnUser(${userLocation.latitude},${userLocation.longitude});true;`,
       );
-    } else {
-      setLocationLoading(true);
+      return;
+    }
+    setLocationLoading(true);
+    try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status === 'granted') {
         const loc = await Location.getCurrentPositionAsync({});
@@ -102,49 +186,65 @@ export function MapScreen() {
           longitude: loc.coords.longitude,
         });
       }
-      setLocationLoading(false);
-    }
-  };
+    } catch (_) {}
+    setLocationLoading(false);
+  }, [userLocation]);
+
+  const onMessage = useCallback(
+    (event: any) => {
+      try {
+        const msg = JSON.parse(event.nativeEvent.data);
+        if (msg.type === 'select') dispatch(selectStation(msg.id));
+        if (msg.type === 'deselect') dispatch(selectStation(null));
+      } catch (_) {}
+    },
+    [dispatch],
+  );
 
   return (
     <View style={styles.container}>
-      <MapView
-        ref={mapRef}
-        provider={PROVIDER_DEFAULT}
+      {/* Leaflet WebView */}
+      <WebView
+        ref={webViewRef}
         style={StyleSheet.absoluteFillObject}
-        initialRegion={DEFAULT_REGION}
-        showsUserLocation
-        showsMyLocationButton={false}
-        customMapStyle={darkMapStyle}
-        onPress={() => dispatch(selectStation(null))}
-      >
-        {filteredStations.map(station => (
-          <Marker
-            key={station.id}
-            coordinate={station.coordinates}
-            onPress={() => dispatch(selectStation(station.id))}
-            tracksViewChanges={false}
-          >
-            <StationMarker
-              station={station}
-              selected={selectedStation?.id === station.id}
-            />
-          </Marker>
-        ))}
-      </MapView>
+        source={{ html }}
+        originWhitelist={['*']}
+        onMessage={onMessage}
+        onLoad={() => setMapReady(true)}
+        javaScriptEnabled
+        domStorageEnabled
+        startInLoadingState
+        renderLoading={() => (
+          <View style={styles.loadingFull}>
+            <ActivityIndicator size="large" color={Colors.primary} />
+            <Text style={styles.loadingText}>Carregando mapa…</Text>
+          </View>
+        )}
+      />
 
       {/* Top overlay */}
-      <SafeAreaView edges={['top']} style={styles.topOverlay} pointerEvents="box-none">
-        <View style={styles.searchBar}>
+      <SafeAreaView
+        edges={['top']}
+        style={styles.topOverlay}
+        pointerEvents="box-none"
+      >
+        <View style={styles.searchBar} pointerEvents="none">
           <Ionicons name="search-outline" size={18} color={Colors.textMuted} />
-          <Text style={styles.searchPlaceholder}>Buscar postos, rua, bairro…</Text>
+          <Text style={styles.searchPlaceholder}>
+            Buscar postos, rua, bairro…
+          </Text>
         </View>
         <FilterBar />
       </SafeAreaView>
 
       {/* Station count badge */}
-      {filteredStations.length > 0 && (
-        <View style={styles.countBadge}>
+      {mapReady && (
+        <View style={styles.countBadge} pointerEvents="none">
+          <Ionicons
+            name="location-outline"
+            size={12}
+            color={Colors.primary}
+          />
           <Text style={styles.countText}>
             {filteredStations.length} posto
             {filteredStations.length !== 1 ? 's' : ''} encontrado
@@ -153,7 +253,7 @@ export function MapScreen() {
         </View>
       )}
 
-      {/* FAB – my location */}
+      {/* My location FAB */}
       <TouchableOpacity
         style={styles.fab}
         onPress={centerOnUser}
@@ -179,6 +279,14 @@ export function MapScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: Colors.background },
+  loadingFull: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: Colors.background,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 14,
+  },
+  loadingText: { color: Colors.textSecondary, fontSize: 14 },
   topOverlay: {
     position: 'absolute',
     top: 0,
@@ -192,7 +300,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    backgroundColor: 'rgba(30,41,59,0.96)',
+    backgroundColor: 'rgba(30,41,59,0.97)',
     borderRadius: Radius.full,
     paddingHorizontal: 16,
     paddingVertical: 11,
@@ -205,7 +313,10 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 148,
     alignSelf: 'center',
-    backgroundColor: 'rgba(30,41,59,0.92)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: 'rgba(30,41,59,0.95)',
     paddingHorizontal: 14,
     paddingVertical: 6,
     borderRadius: Radius.full,
@@ -228,18 +339,3 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
   },
 });
-
-const darkMapStyle = [
-  { elementType: 'geometry', stylers: [{ color: '#1a1f2e' }] },
-  { elementType: 'labels.text.fill', stylers: [{ color: '#8a9bb0' }] },
-  { elementType: 'labels.text.stroke', stylers: [{ color: '#1a1f2e' }] },
-  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#2d3748' }] },
-  {
-    featureType: 'road.highway',
-    elementType: 'geometry',
-    stylers: [{ color: '#3d4f68' }],
-  },
-  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#111827' }] },
-  { featureType: 'poi', stylers: [{ visibility: 'off' }] },
-  { featureType: 'transit', stylers: [{ visibility: 'off' }] },
-];
